@@ -1,8 +1,6 @@
-# Ignorar ambientes virtuais (Onde estao as bibliotecas)
 .venv/
 venv/
 
-# Ignorar outputs de dados e cache (Conforme o Backlog)
 data/processed/*.parquet
 data/embeddings/*.parquet
 __pycache__/
