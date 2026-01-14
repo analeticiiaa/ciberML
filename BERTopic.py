@@ -5,86 +5,119 @@ from tqdm import tqdm
 import sys
 import numpy as np
 from bertopic import BERTopic
+from sklearn.cluster import KMeans
+from umap import UMAP
 
-# Parâmetros otimizados do Backlog (Fonte 263-267)
+# Configurações do Backlog
 HDB_MIN_CLUSTER_SIZE = 12
 UMAP_N_NEIGHBORS = 15
+KMEANS_N_CLUSTERS = 30 
 
 app = typer.Typer()
 tqdm.pandas()
 
 def save_topic_results(df: pd.DataFrame, output_path: Path):
-    # Salva apenas colunas essenciais para análise de tópico
+    """Salva o DataFrame de tópicos em CSV, removendo colunas pesadas."""
     cols_to_save = [c for c in df.columns if c not in ['embedding', 'texto']]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_path, index=False, encoding='utf-8-sig')
-    print(f"\n✅ Resultados de Tópicos salvos em: {output_path}")
-
+    print(f"   -> Dados salvos: {output_path.name}")
 
 @app.command()
 def main(
     input_file: str = typer.Argument("data/embeddings/embeddings.parquet", help="Caminho para o arquivo embeddings.parquet"),
-    output_dir: str = typer.Option("results/topics/", "--output-dir", "-o", help="Pasta de saída para relatórios e CSVs"),
+    output_dir: str = typer.Option("results/topics/", "--output-dir", "-o", help="Pasta de saída"),
 ):
-    print("--- Tarefa 3.2/3.3: Modelagem de Tópicos (BERTopic) ---")
+    print("--- Tarefa 3.2/3.3: Modelagem de Tópicos (BERTopic + HTML) ---")
 
     path_in = Path(input_file)
     if not path_in.exists():
-        print(f"ERRO: Arquivo de Embeddings não encontrado: {input_file}")
+        print(f"ERRO: Arquivo não encontrado: {input_file}")
         sys.exit(1)
 
-    print(f"Lendo corpus de embeddings: {input_file}")
+    print(f"Lendo: {input_file}")
     df = pd.read_parquet(path_in)
 
-    if 'embedding' not in df.columns or 'texto' not in df.columns or 'pais' not in df.columns:
-        print("ERRO: Colunas 'embedding', 'texto' ou 'pais' não encontradas. Verifique o input.")
+    # --- 1. CORREÇÃO DE DADOS (Coluna 'pais') ---
+    if 'pais' not in df.columns:
+        if 'id' in df.columns:
+            print("AVISO: Coluna 'pais' não encontrada. Criando a partir da coluna 'id'...")
+            # Pega tudo antes do primeiro underscore '_' (Ex: 'Brasil_0001' -> 'Brasil')
+            df['pais'] = df['id'].astype(str).apply(lambda x: x.split('_')[0] if '_' in x else 'Desconhecido')
+        else:
+            print("ERRO CRÍTICO: Faltam colunas 'pais' e 'id'. Impossível segmentar.")
+            sys.exit(1)
+    # -------------------------------------------
+
+    if 'embedding' not in df.columns or 'texto' not in df.columns:
+        print(f"ERRO: Faltam colunas obrigatórias. Encontrado: {list(df.columns)}")
         sys.exit(1)
 
-    # 1. PREPARAÇÃO
-    # O BERTopic espera a coluna embedding como uma matriz numpy 2D
-    # (Transforma a Series de listas/arrays em uma matriz 2D)
+    # 2. PREPARAÇÃO
+    print("Preparando matriz de embeddings...")
     embeddings = np.stack(df['embedding'].values)
     texts = df['texto'].tolist()
     
-    # 2. TREINAMENTO DO MODELO GLOBAL (Para uso nas Tarefas 3.2/3.3)
-    print("Iniciando o treinamento do modelo BERTopic (Global)...")
+    # 3. TREINAMENTO (KMeans para estabilidade)
+    print(f"Iniciando treinamento Global (KMeans K={KMEANS_N_CLUSTERS})...")
     
-    # Configurações do modelo BERTopic com base no backlog (Fonte 263-267)
+    clustering_model = KMeans(n_clusters=KMEANS_N_CLUSTERS, random_state=42, n_init='auto')
+    umap_model = UMAP(n_neighbors=UMAP_N_NEIGHBORS, metric='cosine', random_state=42)
+    
     model = BERTopic(
-        min_topic_size=HDB_MIN_CLUSTER_SIZE,
-        umap_args={"n_neighbors": UMAP_N_NEIGHBORS},
-        verbose=True 
+        hdbscan_model=clustering_model,
+        umap_model=umap_model,
+        verbose=True
     )
 
-    # Treina o modelo e transforma os dados
+    # Treina e transforma
     topics, probs = model.fit_transform(texts, embeddings=embeddings)
     
     df['topic_id'] = topics
     df['topic_prob'] = probs
     
-    # 3. ANÁLISE DE RESULTADOS E SALVAMENTO POR PAÍS (Tarefa 3.2)
-    
+    # 4. SALVAMENTO E VISUALIZAÇÃO
     output_dir_path = Path(output_dir)
     output_dir_path.mkdir(parents=True, exist_ok=True)
     
-    # Salva o modelo treinado (para reuso nas tarefas de visualização)
-    model_output_path = output_dir_path / "global_bertopic_model"
-    model.save(str(model_output_path))
-    print(f"Modelo BERTopic salvo em: {model_output_path}")
+    # Salva modelo
+    model.save(str(output_dir_path / "global_bertopic_model"))
 
-    # Salva resultados de tópico para CADA PAÍS, segmentando pelo 'pais'
-    print("\nGerando CSVs de resultados por país (Tarefa 3.2)...")
+    print("\nGerando resultados por país (CSV + HTML):")
     for pais, df_pais in df.groupby('pais'):
-        # Cria um arquivo CSV por país com o Tópico ID
-        output_file_name = f"topics_{pais.lower().replace(' ', '_')}.csv"
-        output_path = output_dir_path / output_file_name
-        save_topic_results(df_pais, output_path)
+        pais_slug = pais.lower().replace(' ', '_')
+        
+        # A. Salvar CSV
+        fname_csv = f"topics_{pais_slug}.csv"
+        save_topic_results(df_pais, output_dir_path / fname_csv)
+        
+        # B. Gerar e Salvar HTML
+        try:
+            # Identifica quais tópicos existem neste país
+            topics_in_country = df_pais['topic_id'].unique().tolist()
+            if -1 in topics_in_country: topics_in_country.remove(-1) # Remove outliers
+            
+            if topics_in_country:
+                # Gera o gráfico interativo apenas para os tópicos do país
+                fig = model.visualize_topics(topics=topics_in_country)
+                fname_html = f"topics_{pais_slug}.html"
+                fig.write_html(str(output_dir_path / fname_html))
+                print(f"   -> Visualização: {fname_html}")
+        except Exception as e:
+            print(f"   [!] Erro ao gerar HTML para {pais}: {e}")
 
-    # Gera o relatório de tópicos (sumário global)
-    report_path = output_dir_path / "global_topic_summary.csv"
-    topic_summary = model.get_topic_info()
-    topic_summary.to_csv(report_path, index=False, encoding='utf-8-sig')
-    print(f"\n✅ Relatório de Tópicos Global salvo em: {report_path}")
+    # 5. RESULTADOS GLOBAIS
+    summary_path = output_dir_path / "global_topic_summary.csv"
+    model.get_topic_info().to_csv(summary_path, index=False, encoding='utf-8-sig')
+    
+    try:
+        fig_global = model.visualize_topics()
+        fig_global.write_html(str(output_dir_path / "global_topics.html"))
+        print(f"\n✅ Visualização Global salva em: global_topics.html")
+    except:
+        pass
+
+    print(f"\nTAREFA 3.2/3.3 CONCLUÍDA! Verifique a pasta: {output_dir}")
 
 if __name__ == "__main__":
     app()
